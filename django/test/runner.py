@@ -16,12 +16,11 @@ from django.core.management import call_command
 from django.db import connections
 from django.test import SimpleTestCase, TestCase
 from django.test.utils import (
-    NullTimeKeeper, TimeKeeper, setup_databases as _setup_databases,
-    setup_test_environment, teardown_databases as _teardown_databases,
-    teardown_test_environment,
+    NullTimeKeeper, TimeKeeper, iter_test_cases,
+    setup_databases as _setup_databases, setup_test_environment,
+    teardown_databases as _teardown_databases, teardown_test_environment,
 )
 from django.utils.datastructures import OrderedSet
-from django.utils.version import PY37
 
 try:
     import ipdb as pdb
@@ -38,6 +37,7 @@ class DebugSQLTextTestResult(unittest.TextTestResult):
     def __init__(self, stream, descriptions, verbosity):
         self.logger = logging.getLogger('django.db.backends')
         self.logger.setLevel(logging.DEBUG)
+        self.debug_sql_stream = None
         super().__init__(stream, descriptions, verbosity)
 
     def startTest(self, test):
@@ -56,8 +56,13 @@ class DebugSQLTextTestResult(unittest.TextTestResult):
 
     def addError(self, test, err):
         super().addError(test, err)
-        self.debug_sql_stream.seek(0)
-        self.errors[-1] = self.errors[-1] + (self.debug_sql_stream.read(),)
+        if self.debug_sql_stream is None:
+            # Error before tests e.g. in setUpTestData().
+            sql = ''
+        else:
+            self.debug_sql_stream.seek(0)
+            sql = self.debug_sql_stream.read()
+        self.errors[-1] = self.errors[-1] + (sql,)
 
     def addFailure(self, test, err):
         super().addFailure(test, err)
@@ -234,8 +239,8 @@ failure and get a correct traceback.
         self.stop_if_failfast()
 
     def addSubTest(self, test, subtest, err):
-        # Follow Python 3.5's implementation of unittest.TestResult.addSubTest()
-        # by not doing anything when a subtest is successful.
+        # Follow Python's implementation of unittest.TestResult.addSubTest() by
+        # not doing anything when a subtest is successful.
         if err is not None:
             # Call check_picklable() before check_subtest_picklable() since
             # check_picklable() performs the tblib check.
@@ -534,15 +539,14 @@ class DiscoverRunner:
                 'Output timings, including database set up and total run time.'
             ),
         )
-        if PY37:
-            parser.add_argument(
-                '-k', action='append', dest='test_name_patterns',
-                help=(
-                    'Only run test methods and classes that match the pattern '
-                    'or substring. Can be used multiple times. Same as '
-                    'unittest -k option.'
-                ),
-            )
+        parser.add_argument(
+            '-k', action='append', dest='test_name_patterns',
+            help=(
+                'Only run test methods and classes that match the pattern '
+                'or substring. Can be used multiple times. Same as '
+                'unittest -k option.'
+            ),
+        )
 
     def setup_test_environment(self, **kwargs):
         setup_test_environment(debug=self.debug_mode)
@@ -678,16 +682,17 @@ class DiscoverRunner:
         return len(result.failures) + len(result.errors)
 
     def _get_databases(self, suite):
-        databases = set()
-        for test in suite:
-            if isinstance(test, unittest.TestCase):
-                test_databases = getattr(test, 'databases', None)
-                if test_databases == '__all__':
-                    return set(connections)
-                if test_databases:
-                    databases.update(test_databases)
-            else:
-                databases.update(self._get_databases(test))
+        databases = {}
+        for test in iter_test_cases(suite):
+            test_databases = getattr(test, 'databases', None)
+            if test_databases == '__all__':
+                test_databases = connections
+            if test_databases:
+                serialized_rollback = getattr(test, 'serialized_rollback', False)
+                databases.update(
+                    (alias, serialized_rollback or databases.get(alias, False))
+                    for alias in test_databases
+                )
         return databases
 
     def get_databases(self, suite):
@@ -713,8 +718,15 @@ class DiscoverRunner:
         self.setup_test_environment()
         suite = self.build_suite(test_labels, extra_tests)
         databases = self.get_databases(suite)
+        serialized_aliases = set(
+            alias
+            for alias, serialize in databases.items() if serialize
+        )
         with self.time_keeper.timed('Total database setup'):
-            old_config = self.setup_databases(aliases=databases)
+            old_config = self.setup_databases(
+                aliases=databases,
+                serialized_aliases=serialized_aliases,
+            )
         run_failed = False
         try:
             self.run_checks(databases)
@@ -754,7 +766,7 @@ def is_discoverable(label):
 
 def reorder_suite(suite, classes, reverse=False):
     """
-    Reorder a test suite by test type.
+    Reorder a test suite by test type, removing any duplicates.
 
     `classes` is a sequence of types
 
@@ -764,70 +776,44 @@ def reorder_suite(suite, classes, reverse=False):
     If `reverse` is True, sort tests within classes in opposite order but
     don't reverse test classes.
     """
-    class_count = len(classes)
-    suite_class = type(suite)
-    bins = [OrderedSet() for i in range(class_count + 1)]
-    partition_suite_by_type(suite, classes, bins, reverse=reverse)
-    reordered_suite = suite_class()
-    for i in range(class_count + 1):
-        reordered_suite.addTests(bins[i])
-    return reordered_suite
+    bins = [OrderedSet() for i in range(len(classes) + 1)]
+    *class_bins, last_bin = bins
 
-
-def partition_suite_by_type(suite, classes, bins, reverse=False):
-    """
-    Partition a test suite by test type. Also prevent duplicated tests.
-
-    classes is a sequence of types
-    bins is a sequence of TestSuites, one more than classes
-    reverse changes the ordering of tests within bins
-
-    Tests of type classes[i] are added to bins[i],
-    tests with no match found in classes are place in bins[-1]
-    """
-    suite_class = type(suite)
-    if reverse:
-        suite = reversed(tuple(suite))
-    for test in suite:
-        if isinstance(test, suite_class):
-            partition_suite_by_type(test, classes, bins, reverse=reverse)
+    for test in iter_test_cases(suite, reverse=reverse):
+        for test_bin, test_class in zip(class_bins, classes):
+            if isinstance(test, test_class):
+                break
         else:
-            for i in range(len(classes)):
-                if isinstance(test, classes[i]):
-                    bins[i].add(test)
-                    break
-            else:
-                bins[-1].add(test)
+            test_bin = last_bin
+        test_bin.add(test)
+
+    suite_class = type(suite)
+    return suite_class(itertools.chain(*bins))
 
 
 def partition_suite_by_case(suite):
     """Partition a test suite by test case, preserving the order of tests."""
-    groups = []
     suite_class = type(suite)
-    for test_type, test_group in itertools.groupby(suite, type):
-        if issubclass(test_type, unittest.TestCase):
-            groups.append(suite_class(test_group))
-        else:
-            for item in test_group:
-                groups.extend(partition_suite_by_case(item))
-    return groups
+    all_tests = iter_test_cases(suite)
+    return [
+        suite_class(tests) for _, tests in itertools.groupby(all_tests, type)
+    ]
+
+
+def test_match_tags(test, tags, exclude_tags):
+    test_tags = set(getattr(test, 'tags', []))
+    test_fn_name = getattr(test, '_testMethodName', str(test))
+    if hasattr(test, test_fn_name):
+        test_fn = getattr(test, test_fn_name)
+        test_fn_tags = list(getattr(test_fn, 'tags', []))
+        test_tags = test_tags.union(test_fn_tags)
+    matched_tags = test_tags.intersection(tags)
+    return (matched_tags or not tags) and not test_tags.intersection(exclude_tags)
 
 
 def filter_tests_by_tags(suite, tags, exclude_tags):
     suite_class = type(suite)
-    filtered_suite = suite_class()
-
-    for test in suite:
-        if isinstance(test, suite_class):
-            filtered_suite.addTests(filter_tests_by_tags(test, tags, exclude_tags))
-        else:
-            test_tags = set(getattr(test, 'tags', set()))
-            test_fn_name = getattr(test, '_testMethodName', str(test))
-            test_fn = getattr(test, test_fn_name, test)
-            test_fn_tags = set(getattr(test_fn, 'tags', set()))
-            all_tags = test_tags.union(test_fn_tags)
-            matched_tags = all_tags.intersection(tags)
-            if (matched_tags or not tags) and not all_tags.intersection(exclude_tags):
-                filtered_suite.addTest(test)
-
-    return filtered_suite
+    return suite_class(
+        test for test in iter_test_cases(suite)
+        if test_match_tags(test, tags, exclude_tags)
+    )
